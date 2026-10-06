@@ -4,7 +4,7 @@
 不传时区时按 UTC 处理。
 有效期统一按半开区间 [valid_from, valid_to) 解释，首尾相接不算重叠。
 """
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -12,6 +12,19 @@ from pydantic import BaseModel, Field, model_validator
 CertKind = Literal["REFERENCE", "CALIBRATION"]
 CertStatus = Literal["ACTIVE", "REVOKED", "INVALID"]
 CertConclusion = Literal["PASS", "FAIL"]
+
+
+def as_utc(value: datetime) -> datetime:
+    """把时间统一到“同一绝对时刻”的带时区形式：
+
+    无时区（offset-naive）的输入按既有约定视为 UTC；带偏移（offset-aware）
+    的输入换算为 UTC、绝对时刻不变。所有跨字段的时间先后/区间比较都必须先
+    经过本函数——直接比较 naive 与 aware 会抛 TypeError（曾导致混用输入
+    在校验阶段返回 500，而非参数错误 422）。
+    """
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class _IssueBase(BaseModel):
@@ -28,11 +41,16 @@ class _IssueBase(BaseModel):
 
     @model_validator(mode="after")
     def _check_window(self):
-        if self.valid_from >= self.valid_to:
+        # 无时区时间按 UTC 处理；先统一为带时区的同一绝对时刻再比较，
+        # 避免“无时区字段 + 带偏移字段”混用时 naive/aware 直接比较抛 TypeError。
+        vf = as_utc(self.valid_from)
+        vt = as_utc(self.valid_to)
+        if vf >= vt:
             raise ValueError("valid_from 必须早于 valid_to")
         if self.calibrated_at is None:
             self.calibrated_at = self.valid_from
-        if not (self.valid_from <= self.calibrated_at < self.valid_to):
+        calibrated = as_utc(self.calibrated_at)
+        if not (vf <= calibrated < vt):
             raise ValueError("calibrated_at 必须落在 [valid_from, valid_to) 内")
         return self
 
@@ -537,7 +555,8 @@ class WorkOrderRegisterRequest(BaseModel):
         self.client = self.client.strip()
         if not self.work_order_no or not self.device_id or not self.client:
             raise ValueError("工单号、设备标识与委托人均不得为空白")
-        if self.scheduled_from >= self.scheduled_to:
+        # 无时区时间按 UTC 处理：统一到同一绝对时刻后再比较半开区间
+        if as_utc(self.scheduled_from) >= as_utc(self.scheduled_to):
             raise ValueError("scheduled_from 必须早于 scheduled_to（计划时段按半开区间 [from, to) 判定）")
         return self
 

@@ -457,7 +457,30 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
 
 ## HTTP API
 
-所有时间字段为带时区 ISO 8601，例如 `2026-03-01T09:00:00+08:00`。
+### 时间字段的时区约定（本轮补充）
+
+所有时间字段接受 ISO 8601：
+
+- **推荐显式带时区偏移**，例如 `2026-03-01T09:00:00+08:00` 或
+  `2026-03-01T01:00:00Z`；
+- **省略偏移的“无时区”时间一律按 UTC 解释**（如 `2026-03-01T09:00:00`
+  等价于 `2026-03-01T09:00:00Z`），与既有约定一致；
+- 同一份请求中各字段可混用写法：服务端先把每个时间换算到 UTC 的
+  **同一绝对时刻**，再校验 `valid_from < valid_to` 与
+  `valid_from <= calibrated_at < valid_to`（半开区间）。因此
+  `valid_from: "2026-03-01T00:00:00"`（无时区→UTC）与
+  `valid_to: "2027-03-01T00:00:00+08:00"`（= `2026-12-31T16:00:00Z`）
+  是合法区间；而 `2026-03-01T08:00:00` 配 `2026-03-01T09:00:00+08:00`
+  虽然本地时钟数字递增，换算 UTC 后为 `08:00Z >= 01:00Z`，仍判定为非法区间；
+- 非法区间返回既有参数错误格式（FastAPI `422`，`detail` 数组，
+  `valid_from 必须早于 valid_to` / `calibrated_at 必须落在 [valid_from, valid_to) 内`），
+  **不写入证书或复核申请；批次请求整批不落库**（含批内本来合法的条目）；
+- 落库与响应中的时间统一为带时区 UTC（TIMESTAMPTZ），输入是什么写法不影响
+  绝对时刻；每日限额按 `calibrated_at` 换算 UTC 后的日历日期计数，显式偏移
+  与无时区（按 UTC）输入只要是同一绝对时刻，计入的 UTC 日期与限额结果完全一致。
+
+单张签发、交接批次、双人复核申请共用同一套校验；同批次键、同申请号的
+同内容重放仍返回首次结果，异内容仍为 `409 …_conflict`。
 
 ### 1. 登记基准设备合格证书（追溯起点）
 
@@ -511,6 +534,45 @@ curl -sS -X POST http://localhost:8080/api/v1/certificates \
     "conclusion": "PASS",
     "parent_cert_no": "CAL-WS-001"
   }'
+```
+
+**修复后的时区混用示例**（无时区按 UTC，带偏移按其偏移，按同一绝对时刻校验）：
+
+```bash
+# 合法：valid_from 无时区 -> 2026-03-01T00:00Z；
+#       valid_to +08 -> 2027-02-28T16:00Z，绝对时刻区间 [2026-03-01Z, 2027-02-28T16Z)
+curl -sS -X POST http://localhost:8080/api/v1/certificates \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cert_no": "CAL-TZ-001",
+    "device_id": "DEV-TZ-1",
+    "valid_from": "2026-03-01T00:00:00",
+    "valid_to":   "2027-03-01T00:00:00+08:00",
+    "calibrated_at": "2026-03-02T09:00:00+08:00",
+    "conclusion": "PASS",
+    "parent_cert_no": "REF-MASTER-001"
+  }'
+# 201：certificate.valid_to 落库为 "2027-02-28T16:00:00+00:00"，
+#       calibrated_at 落库为 "2026-03-02T01:00:00+00:00"（绝对时刻不变）
+```
+
+```bash
+# 非法：本地时钟 08:00 < 09:00 看似递增，但 09:00+08 = 01:00Z，
+#       绝对时刻倒挂 -> 422（修复前此请求返回 500）
+curl -i -sS -X POST http://localhost:8080/api/v1/certificates \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cert_no": "CAL-TZ-BAD",
+    "device_id": "DEV-TZ-1",
+    "valid_from": "2026-03-01T08:00:00",
+    "valid_to":   "2026-03-01T09:00:00+08:00",
+    "conclusion": "PASS",
+    "parent_cert_no": "REF-MASTER-001"
+  }'
+# HTTP/1.1 422 Unprocessable Content
+# {"detail":[{"type":"value_error","loc":["body"],
+#   "msg":"Value error, valid_from 必须早于 valid_to", ...}]}
+# CAL-TZ-BAD 不会出现在证书列表中
 ```
 
 ### 2B. 设定/调整标准证书每日校准使用量上限（管理员，X-Management-Key）

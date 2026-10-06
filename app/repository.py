@@ -242,9 +242,9 @@ def _validate_parent(
             f"引用的标准证书 {parent_no} 结论为不合格，不得作为校准依据",
         )
     covers = conn.execute(
-        "SELECT tstzrange(valid_from, valid_to, '[)') @> %s AS ok FROM certificates "
+        "SELECT tstzrange(valid_from, valid_to, '[)') @> %s::timestamptz AS ok FROM certificates "
         "WHERE cert_no = %s",
-        (calibrated_at, parent_no),
+        (_as_utc(calibrated_at), parent_no),
     ).fetchone()
     if not covers or not covers["ok"]:
         raise ApiError(
@@ -276,6 +276,10 @@ def _assert_no_cycle(conn, parent_no: str, new_cert_no: str) -> None:
 
 
 def _assert_no_overlap(conn, device_id: str, valid_from, valid_to, exclude_no: str | None) -> None:
+    # 无时区输入按 UTC 处理：统一为带时区值后再构造 tstzrange，
+    # 避免 naive datetime 被适配为 timestamp without time zone 而无匹配函数/操作符。
+    valid_from = _as_utc(valid_from)
+    valid_to = _as_utc(valid_to)
     row = conn.execute(
         """
         SELECT cert_no FROM certificates
@@ -307,8 +311,9 @@ def _raw_insert_certificate(conn, *, kind: str, conclusion: str, parent_no: str 
         )
         """,
         (
-            req.cert_no, kind, req.device_id, req.device_name, req.calibrated_at,
-            req.valid_from, req.valid_to, conclusion, parent_no, req.operator, req.remark,
+            req.cert_no, kind, req.device_id, req.device_name, _as_utc(req.calibrated_at),
+            _as_utc(req.valid_from), _as_utc(req.valid_to), conclusion,
+            parent_no, req.operator, req.remark,
         ),
     )
 
@@ -842,7 +847,7 @@ def _batch_overlap_error(conn, req) -> ApiError:
               AND tstzrange(valid_from, valid_to, '[)') && tstzrange(%s, %s, '[)')
             LIMIT 1
             """,
-            (it.device_id, it.valid_from, it.valid_to),
+            (it.device_id, _as_utc(it.valid_from), _as_utc(it.valid_to)),
         ).fetchone()
         if row:
             return ApiError(
