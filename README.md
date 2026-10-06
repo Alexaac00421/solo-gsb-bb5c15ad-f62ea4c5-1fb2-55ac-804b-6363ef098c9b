@@ -457,7 +457,28 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
 
 ## HTTP API
 
-所有时间字段为带时区 ISO 8601，例如 `2026-03-01T09:00:00+08:00`。
+### 时间约定（本轮明确并统一）
+
+- 时间字段一律接受 ISO 8601，**建议携带时区偏移**，例如
+  `2026-03-01T09:00:00+08:00`；`Z` 表示 UTC（`2026-03-01T01:00:00Z`）。
+- **不带时区的时间按既有约定视为 UTC**（等价于 `...Z`）。服务在参数校验前
+  先把 `valid_from` / `valid_to` / `calibrated_at`（以及工单的
+  `scheduled_from` / `scheduled_to`）统一归一为 UTC 的**同一绝对时刻**再比较，
+  因此同一请求中三个字段一个带偏移、一个不带时区也能正确比较，不会再因
+  naive/aware 混用抛出 `TypeError`（旧行为为 `500`）。
+- 有效期按半开区间 `[valid_from, valid_to)`、校准时刻按
+  `valid_from <= calibrated_at < valid_to` 校验，**一律以绝对时刻判定**：
+  例如 `valid_from=2026-03-02T00:00:00+08:00` 与
+  `valid_to=2026-03-01T16:00:00Z` 是同一时刻，属非法区间。
+  非法窗口（含校准时刻越界）返回与其他结构校验相同的 `422` 参数错误
+  （FastAPI `{"detail":[...]}` 格式）：单张不签发、复核申请不保存、批次整批不落库。
+- 归一化后，**不同偏移写法只要表示同一绝对时刻即视为相同请求**（批次键、
+  申请号的幂等指纹按绝对时刻一致判定）：`08:00+08:00`、`00:00Z` 与
+  `00:00`（无时区）重放等价；相差一秒的不同时刻仍按异内容 `409` 冲突。
+- 每日限额按 `calibrated_at` 的 **UTC 日历日**核算，显式偏移输入与 UTC
+  输入只要落在同一 UTC 日，扣额结果完全一致（见 2B 节切日示例）。
+- 响应中的时间均为带时区 ISO 8601（数据库回读统一呈现 `+00:00`，幂等快照中
+  的签发资料呈现 `Z`，二者都表示 UTC 同一绝对时刻）。
 
 ### 1. 登记基准设备合格证书（追溯起点）
 
@@ -513,6 +534,35 @@ curl -sS -X POST http://localhost:8080/api/v1/certificates \
   }'
 ```
 
+**不带时区的时间按 UTC 处理，且三个时间字段允许混用偏移写法**——服务先归一
+为同一绝对时刻，再按半开区间 `[valid_from, valid_to)` 与
+`valid_from <= calibrated_at < valid_to` 校验：
+
+```bash
+# valid_from/calibrated_at 无时区（=UTC），valid_to 带 +08:00 偏移：
+# 实际窗口为 [2026-03-01T00:00:00Z, 2026-03-01T16:00:00Z)，校准时刻 12:00Z 在内 -> 201
+curl -sS -X POST http://localhost:8080/api/v1/certificates \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cert_no": "CAL-MIX-001",
+    "device_id": "DEV-MIX",
+    "valid_from": "2026-03-01T00:00:00",
+    "valid_to":   "2026-03-02T00:00:00+08:00",
+    "calibrated_at": "2026-03-01T12:00:00",
+    "conclusion": "PASS",
+    "parent_cert_no": "REF-MASTER-001"
+  }'
+```
+
+非法区间（如归一后 `valid_from >= valid_to`，或 `calibrated_at` 不在半开区间内）
+返回既有参数错误格式（HTTP `422`，FastAPI 校验错误体），不会签发证书；该规则
+对单张签发、交接批次（整批不落库）与双人复核申请（不保存申请）完全一致：
+
+```json
+{"detail":[{"type":"value_error","loc":["body"],
+  "msg":"Value error, valid_from 必须早于 valid_to", ...}]}
+```
+
 ### 2B. 设定/调整标准证书每日校准使用量上限（管理员，X-Management-Key）
 
 管理员凭管理密钥为“被直接引用的上游证书编号 × UTC 日期”配置非负每日上限。
@@ -544,7 +594,8 @@ curl -sS -X PUT http://localhost:8080/api/v1/certificates/REF-MASTER-001/daily-q
 注意 `calibrated_at` 按 **UTC** 切日：上例的普通证书若传
 `2026-03-05T08:00:00+08:00`（= `2026-03-05T00:00:00Z`）计入 `2026-03-05`，
 而 `2026-03-05T07:59:00+08:00`（= `2026-03-04T23:59:00Z`）仍计入
-`2026-03-04`。
+`2026-03-04`。显式偏移、`Z` 与无时区（按 UTC）三种写法在校验前归一到同一
+绝对时刻，因此**同一时刻无论怎么写，命中的 UTC 日与扣额结果完全相同**。
 
 ```bash
 # 上调为 3（200）
@@ -647,7 +698,11 @@ curl -sS -X POST http://localhost:8080/api/v1/certificate-review-requests \
 - 录入凭据缺失/错误（含误用复核凭据）→ `401 invalid_identity_key`；
 - 签发资料本身的结构校验（时间窗口、字段长度等）与直接签发一致，
   结构不合法 `422`；但父证书存在性、生效/合格/有效期、停用、区间重叠、
-  编号占用等**业务校验不在提交时执行**。
+  编号占用等**业务校验不在提交时执行**；
+- 时间窗口同样“无时区按 UTC、按同一绝对时刻校验”：三个时间字段混用偏移
+  写法时按绝对时刻判定，非法窗口返回 `422` 参数错误且**不保存申请**；
+  幂等指纹按绝对时刻归一，因此 `08:00+08:00` 与 `00:00Z`（或无时区
+  `00:00`）表示同一时刻的重试视为同内容（`200` 原申请）。
 
 ### 4. 复核人驳回 / 批准（X-Reviewer-Key，批准同事务真正签发）
 
@@ -815,11 +870,15 @@ curl -sS -X POST http://localhost:8080/api/v1/certificate-batches \
 幂等与冲突约定：
 
 - **同键同请求重试** → `200`，返回首次签发结果快照（即使证书事后被撤销）；
-- **同键不同请求** → `409 batch_conflict`；
+  同内容按**归一后的绝对时刻**判定：把 `+08:00` 改写为等价的 `Z`/无时区
+  （UTC）表示仍返回首次快照；
+- **同键不同请求** → `409 batch_conflict`（绝对时刻不同即异内容，哪怕只差一秒）；
 - **任一记录不合规** → 整批不落库，错误响应 `details.cert_no` 定位出错编号，
   错误码与单张签发一致（如 `reference_not_active`、`validity_overlap`），
   批内特有问题使用 `batch_cert_duplicate`（批内编号重复）与
-  `reference_cycle`（批内引用成环）。
+  `reference_cycle`（批内引用成环）；时间窗口非法（含三个字段混用偏移导致的
+  `valid_from >= valid_to`、`calibrated_at` 越界）在参数校验阶段返回
+  `422`，同样整批不落库。
 
 ### 11. 查询签发批次（首次签发结果快照）
 
@@ -1416,7 +1475,9 @@ curl -sS -X POST http://localhost:8080/api/v1/delivery-revocation-notices/1/conf
 **(1) 登记工单** —— 唯一工单号 + 设备标识 + 委托人 + 带时区计划校准半开区间
 `[scheduled_from, scheduled_to)`。登记不预占证书编号/有效期/每日限额，初始
 `PENDING`。同号同内容重试返回原工单（`200`），同号异内容
-`409 work_order_conflict`：
+`409 work_order_conflict`。计划时段与证书时间遵守同一时间约定：不带时区按
+UTC、两个端点允许混用偏移写法，服务归一为绝对时刻后再校验起点早于终点
+（非法窗口返回 `422` 参数错误，不登记工单）：
 
 ```bash
 curl -sS -X POST http://localhost:8080/api/v1/work-orders \
@@ -1525,6 +1586,13 @@ curl -sS http://localhost:8080/api/v1/work-orders/WO-2026-0001 \
 ## 错误响应
 
 统一格式：`{"error": {"code": "...", "message": "...", "details": {...}}}`
+
+请求体/查询参数的结构校验由 FastAPI 完成，失败返回 HTTP `422`，响应体为
+`{"detail": [{"loc": [...], "msg": "...", "type": "value_error", ...}]}`
+（与上面的业务错误体不同）。其中时间窗口规则为：无时区按 UTC、按同一绝对
+时刻校验 `valid_from < valid_to` 与
+`valid_from <= calibrated_at < valid_to`（半开区间）；非法窗口在参数阶段即
+被拒绝——单张不签发、复核申请不保存、批次整批不落库。
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |

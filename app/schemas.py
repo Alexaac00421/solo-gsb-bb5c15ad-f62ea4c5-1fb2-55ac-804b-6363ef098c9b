@@ -1,10 +1,12 @@
 """Pydantic 请求与响应模型。
 
 时间一律使用带时区的 ISO 8601（如 2026-03-01T09:00:00+08:00），
-不传时区时按 UTC 处理。
+不传时区时按 UTC 处理：校验前统一归一为带时区的 UTC 同一绝对时刻，
+因此带任意偏移的显式时区输入与对应 UTC 输入等价（区间比较与
+calibrated_at 按 UTC 切日的每日限额结果完全一致）。
 有效期统一按半开区间 [valid_from, valid_to) 解释，首尾相接不算重叠。
 """
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -14,26 +16,47 @@ CertStatus = Literal["ACTIVE", "REVOKED", "INVALID"]
 CertConclusion = Literal["PASS", "FAIL"]
 
 
+def _as_utc(value: datetime) -> datetime:
+    """无时区时间按约定视为 UTC；带偏移时间换算到同一绝对时刻的 UTC。
+
+    先归一再比较，避免 naive/aware 混用比较时抛 TypeError；归一后同一
+    绝对时刻在规范化 JSON（幂等指纹）中也呈现为同一表示。
+    """
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class _IssueBase(BaseModel):
     cert_no: str = Field(..., min_length=1, max_length=128, description="证书编号，全局唯一")
     device_id: str = Field(..., min_length=1, max_length=128, description="被校/基准设备标识")
     device_name: str | None = Field(None, max_length=256, description="设备名称")
     calibrated_at: datetime | None = Field(
-        None, description="校准时刻；缺省取 valid_from"
+        None, description="校准时刻；缺省取 valid_from。不带时区按 UTC 处理"
     )
-    valid_from: datetime = Field(..., description="有效期开始")
-    valid_to: datetime = Field(..., description="有效期结束（不含该时刻）")
+    valid_from: datetime = Field(..., description="有效期开始（不带时区按 UTC 处理）")
+    valid_to: datetime = Field(
+        ..., description="有效期结束（不含该时刻；不带时区按 UTC 处理）"
+    )
     operator: str | None = Field(None, max_length=128)
     remark: str | None = Field(None, max_length=1024)
 
     @model_validator(mode="after")
     def _check_window(self):
-        if self.valid_from >= self.valid_to:
+        # 先按“无时区即 UTC”统一归一到同一绝对时刻再比较：
+        # 任一组合（naive/aware、不同偏移）都按绝对时刻判定，不抛 TypeError。
+        valid_from = _as_utc(self.valid_from)
+        valid_to = _as_utc(self.valid_to)
+        if valid_from >= valid_to:
             raise ValueError("valid_from 必须早于 valid_to")
-        if self.calibrated_at is None:
-            self.calibrated_at = self.valid_from
-        if not (self.valid_from <= self.calibrated_at < self.valid_to):
+        calibrated_at = (
+            valid_from if self.calibrated_at is None else _as_utc(self.calibrated_at)
+        )
+        if not (valid_from <= calibrated_at < valid_to):
             raise ValueError("calibrated_at 必须落在 [valid_from, valid_to) 内")
+        self.valid_from = valid_from
+        self.valid_to = valid_to
+        self.calibrated_at = calibrated_at
         return self
 
 
@@ -537,6 +560,10 @@ class WorkOrderRegisterRequest(BaseModel):
         self.client = self.client.strip()
         if not self.work_order_no or not self.device_id or not self.client:
             raise ValueError("工单号、设备标识与委托人均不得为空白")
+        # 无时区按 UTC 处理，统一为带时区 UTC 后再按同一绝对时刻比较，
+        # 避免 scheduled_from/scheduled_to 一个带偏移、一个不带时抛 TypeError。
+        self.scheduled_from = _as_utc(self.scheduled_from)
+        self.scheduled_to = _as_utc(self.scheduled_to)
         if self.scheduled_from >= self.scheduled_to:
             raise ValueError("scheduled_from 必须早于 scheduled_to（计划时段按半开区间 [from, to) 判定）")
         return self

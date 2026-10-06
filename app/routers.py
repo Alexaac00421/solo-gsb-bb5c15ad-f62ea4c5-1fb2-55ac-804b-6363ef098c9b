@@ -78,12 +78,24 @@ def pool_dep(request: Request) -> ConnectionPool:
 
 @router.post("/reference-certificates", status_code=201)
 def issue_reference(req: ReferenceIssueRequest, pool: ConnectionPool = Depends(pool_dep)):
+    """登记基准设备合格证书（追溯起点）。
+
+    时间字段不带时区时按 UTC 处理：valid_from/valid_to/calibrated_at 在校验前
+    统一归一为同一绝对时刻，允许三者混用偏移写法；非法半开区间返回 422 参数错误。
+    """
     with pool.connection() as conn:
         return repo.issue_reference(conn, req)
 
 
 @router.post("/certificates", status_code=201)
 def issue_certificate(req: CertificateIssueRequest, pool: ConnectionPool = Depends(pool_dep)):
+    """签发普通校准证书。
+
+    时间字段不带时区时按 UTC 处理：valid_from/valid_to/calibrated_at 在校验前
+    统一归一为同一绝对时刻（允许混用偏移写法），再按半开区间
+    [valid_from, valid_to) 与 valid_from <= calibrated_at < valid_to 校验；
+    非法窗口返回 422 参数错误、不签发证书。
+    """
     with pool.connection() as conn:
         return repo.issue_certificate(conn, req)
 
@@ -160,6 +172,9 @@ def submit_certificate_review(
 
     申请号为幂等键：同号同内容重试返回原申请（200），同号异内容
     409 review_request_conflict；录入凭据缺失/错误 401 invalid_identity_key。
+    时间字段不带时区时按 UTC 处理，校验前归一为同一绝对时刻（允许混用偏移
+    写法）；非法时间窗口返回 422 参数错误，不保存申请。幂等指纹按归一后的
+    绝对时刻判定：同一时刻的不同偏移/无时区写法视为同内容。
     """
     with pool.connection() as conn:
         body, created = repo.submit_certificate_review(conn, req, x_entry_key)
@@ -213,7 +228,12 @@ def get_certificate_review(
 def issue_certificate_batch(
     req: BatchIssueRequest, response: Response, pool: ConnectionPool = Depends(pool_dep)
 ):
-    """批量签发交接批次：整批原子落库；批次键幂等（重放返回 200 与首次相同的结果）。"""
+    """批量签发交接批次：整批原子落库；批次键幂等（重放返回 200 与首次相同的结果）。
+
+    时间字段不带时区时按 UTC 处理，各证书时间在校验前归一为同一绝对时刻
+    （允许混用偏移写法）；任一条目时间窗口非法即返回 422 参数错误，整批不落库。
+    幂等指纹按归一后的绝对时刻判定：同一时刻的不同偏移/无时区写法视为同请求。
+    """
     with pool.connection() as conn:
         body, created = repo.issue_batch(conn, req)
     if not created:
